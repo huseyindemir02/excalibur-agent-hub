@@ -1,0 +1,45 @@
+#!/usr/bin/env node
+// Prints one line per message that directly calls an agent (@mention, --to <agent>, or a reply to
+// its message). Run by a Claude session's Monitor: each line wakes that session, which then wakes
+// the target agent (e.g. via the desktop app's cross-session messages). Keeps its own read markers
+// in ~/.agent-hub/wake-<agent>.json, so agents' own `hub unread` markers are untouched.
+//   hub-wake-watch '*Luna' Excalibur     (agents to watch; '*' = coordinator, also woken by every message from Hüseyin)
+import { readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
+const PORT = Number(process.env.HUB_PORT || 7788);
+const DATA = process.env.HUB_DATA || join(homedir(), '.agent-hub');
+const coordinator = (process.argv.slice(2).find(a => a.startsWith('*')) || '').slice(1);
+const agents = process.argv.slice(2).map(a => a.replace(/^\*/, ''));
+if (!agents.length) { console.error('usage: hub-wake-watch <agent> [agent…]'); process.exit(1); }
+const token = readFileSync(join(DATA, 'token'), 'utf8').trim();
+const marker = (a) => join(DATA, `wake-${a.replace(/[^\p{L}\p{N}_-]/gu, '_')}.json`);
+
+async function check(agent) {
+  let since = 0;
+  try { since = JSON.parse(readFileSync(marker(agent), 'utf8')).since || 0; } catch {
+    // First run: start from now, do not replay history.
+    const latest = await fetch(`http://127.0.0.1:${PORT}/api/inbox?as=${encodeURIComponent(agent)}&since=0&limit=500`, { headers: { 'X-Hub-Token': token } }).then(r => r.json());
+    since = latest.at?.(-1)?.id || 0;
+    writeFileSync(marker(agent), JSON.stringify({ since }));
+    return;
+  }
+  const rows = await fetch(`http://127.0.0.1:${PORT}/api/inbox?as=${encodeURIComponent(agent)}&since=${since}&limit=100`, {
+    headers: { 'X-Hub-Token': token }, signal: AbortSignal.timeout(8000),
+  }).then(r => r.json());
+  if (!Array.isArray(rows) || !rows.length) return;
+  const low = agent.toLowerCase();
+  for (const m of rows) {
+    const everyone = /(^|\s)@(herkes|all)\b/iu.test(m.text || '');
+    const direct = m.to_agent === agent || everyone || (m.text || '').toLowerCase().includes('@' + low) || m.reply?.author === agent
+      || (agent === coordinator && m.author === 'Hüseyin');
+    if (direct) console.log(`WAKE ${agent} #${m.id} [${m.project}] ${m.author}: ${(m.text || '📎').replace(/\s+/g, ' ').slice(0, 180)}`);
+  }
+  writeFileSync(marker(agent), JSON.stringify({ since: rows.at(-1).id }));
+}
+
+for (;;) {
+  for (const a of agents) { try { await check(a); } catch { /* hub restarting: try again next round */ } }
+  await new Promise(r => setTimeout(r, 30000));
+}

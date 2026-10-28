@@ -1,0 +1,353 @@
+#!/usr/bin/env node
+// Agent Hub CLI — how every agent talks in the hub. Identity: --as <name> or HUB_AGENT.
+//   hub say <project> "<text>" [--kind request|ack|claim|done|heartbeat|note|conflict|takeover|chat] [--to <agent>] [--topic <pkg>] [--file a.png,b.pdf] [--reply <messageId>]
+//   hub retract <messageId>            retract your own chat message (log records are protected)
+//   hub get <fileId> [dir]              download an attachment (default ~/.agent-hub/downloads) — e.g. to look at a screenshot
+//   hub read <project> [-n 30]          last messages of a project tab
+//   hub unread                          everything new for me (all projects): operator, @mentions, --to me/all
+//   hub avatar <emoji | image.png>     your profile picture   ·   hub coordinator <name>   move the ⭐ (handoff)
+//   hub retire <name> | hub unretire <name>   retire/unretire an agent (operator or coordinator only)
+//   hub config [set --port <port> --lan <true|false>]   view or update port and LAN settings
+//   hub schedule                        published check/heartbeat interval — set your own timer to it
+//   hub projects | hub who [--all] | hub usage [--raw '<get_usage JSON>']   (posts YOUR limits; Codex is automatic)
+//   hub log <project> "<Agent> · <TYPE> · <pkg> · <text>"   coord.sh-style line (used by the bridge)
+//   hub import <project> <LOG.md>       one-time import of a "- YYYY-MM-DD HH:MM · Agent · TYPE · pkg · text" log
+import { scheduleText, SCHEDULE_I18N } from '../schedule-i18n.mjs';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { basename } from 'node:path';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
+const DATA = process.env.HUB_DATA || join(homedir(), '.agent-hub');
+let config = {};
+try { config = JSON.parse(readFileSync(join(DATA, 'config.json'), 'utf8')); } catch {}
+const PORT = Number(process.env.HUB_PORT || config.port || 7788);
+const BASE = `http://127.0.0.1:${PORT}`;
+const TIMEOUT_MS = Number(process.env.HUB_TIMEOUT_MS) || 8000;
+const MAX_TEXT = 8000; // server limit (server.mjs MAX_TEXT)
+const KINDS = ['approval', 'chat', 'request', 'ack', 'claim', 'done', 'heartbeat', 'note', 'conflict', 'takeover', 'command'];
+
+const args = process.argv.slice(2);
+const flag = (name, short) => {
+  const i = args.findIndex(a => a === `--${name}` || (short && a === `-${short}`));
+  if (i === -1) return null;
+  const v = args[i + 1];
+  args.splice(i, 2);
+  return v;
+};
+const boolFlag = (name) => {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return false;
+  args.splice(i, 1);
+  return true;
+};
+const as = flag('as') || process.env.HUB_AGENT || '';
+const tool = flag('tool') || process.env.HUB_TOOL || null;
+const opt = { lang: flag('lang'), kind: flag('kind'), to: flag('to'), topic: flag('topic'), n: flag('n', 'n'), plan: flag('plan'), note: flag('note'), file: flag('file'), reply: flag('reply'), raw: flag('raw'), all: boolFlag('all'), port: flag('port'), lan: flag('lan') };
+const die = (msg) => { console.error(`hub: ${msg}`); process.exit(1); };
+
+let token;
+try { token = readFileSync(join(DATA, 'token'), 'utf8').trim(); } catch { die(`no token at ${DATA}/token — is the hub server installed?`); }
+
+// Say what actually failed: a slow/stuck server is not the same as one that is not running.
+function why(e, path, ms = TIMEOUT_MS) {
+  const code = e?.cause?.code || e?.code;
+  if (e?.name === 'TimeoutError') return `hub server at ${BASE} did not answer ${path} within ${ms / 1000}s (busy or stuck; HUB_TIMEOUT_MS raises the limit)`;
+  if (code === 'ECONNREFUSED') return `hub server not running at ${BASE} (connection refused) — start it: node ~/agent-hub/server.mjs`;
+  return `request ${path} to ${BASE} failed: ${[code, e?.cause?.message || e?.message].filter(Boolean).join(' ')}`;
+}
+
+async function api(path, body, method = null) {
+  let res, raw;
+  try {
+    res = await fetch(BASE + path, {
+      method: method || (body ? 'POST' : 'GET'),
+      headers: { 'X-Hub-Token': token, 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    raw = await res.text();
+  } catch (e) { die(why(e, path.split('?')[0])); }
+  let json;
+  try { json = JSON.parse(raw); } catch { die(`HTTP ${res.status} from ${path.split('?')[0]}: response is not JSON`); }
+  if (!res.ok) die(`HTTP ${res.status}: ${json.error || 'request failed'}`);
+  return json;
+}
+
+const line = (m) => {
+  const t = new Date(m.created_at).toLocaleString('sv-SE').slice(0, 16);
+  const to = m.to_agent ? ` → ${m.to_agent}` : '';
+  const topic = m.topic ? ` · ${m.topic}` : '';
+  const files = (m.files || []).map(f => ` [ek: ${f.name} → hub get ${f.id}]`).join('');
+  const reply = m.reply ? ` ↪ #${m.reply.id} ${m.reply.author}: "${m.reply.text.slice(0, 60)}"` : '';
+  return `#${m.id} ${t} [${m.project}] ${m.author}${to} · ${m.kind.toUpperCase()}${topic}${reply} · ${m.text}${files}`;
+};
+
+/** "- 2026-10-10 09:00 · Agent · REQUEST → X · pkg · text" (timestamp optional) → message fields. */
+function parseLogLine(raw) {
+  const clean = raw.trim().replace(/^- (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) · \1 · /, '- $1 · ');
+  const m = /^(?:- (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) · )?([^·]+?) · ([^·]+?) · (.*)$/s.exec(clean);
+  if (!m) return null;
+  const [, stamp, author, type, restText] = m;
+  const directed = /^(REQUEST|NOTE|ACK)\s*→\s*(.+)$/i.exec(type.trim());
+  const kindWord = (directed ? directed[1] : type.trim().split(/\s/)[0]).toLowerCase();
+  const to = directed?.[2]?.trim().split(/\s/)[0] || null;
+  const [topic, ...textParts] = restText.split(' · ');
+  return {
+    author: author.trim(),
+    kind: KINDS.includes(kindWord) ? kindWord : 'note',
+    to: to === 'herkes' ? 'all' : to,
+    topic: textParts.length ? topic.trim() : null,
+    text: ((stamp ? `[${stamp}] ` : '') + (textParts.join(' · ') || topic)).slice(0, 8000),
+  };
+}
+
+const statePath = () => join(DATA, `seen-${as.replace(/[^\p{L}\p{N}_-]/gu, '_')}.json`);
+const needAs = () => { if (!as) die('who are you? use --as <name> or HUB_AGENT=<name>'); };
+
+const [cmd, ...rest] = args;
+switch (cmd) {
+  case 'say': {
+    needAs();
+    const rawKind = (opt.kind || 'chat').toLowerCase();
+    const kind = rawKind === 'onay' ? 'approval' : rawKind;
+    const { to, topic } = opt;
+    const [project, ...words] = rest;
+    if (!KINDS.includes(kind)) die(`kind must be one of ${KINDS.join(', ')}`);
+    if (!['coordination', 'koordinasyon'].includes(project) && (kind === 'heartbeat' || kind === 'takeover' || kind === 'conflict')) {
+      console.error(`⚠️ ${project} is for project work; heartbeats and takeovers belong in the coordination channel.`);
+    }
+    const text = words.join(' ').trim();
+    if (!project || (!text && !opt.file)) die('usage: hub say <project> "<text>" [--kind …] [--to …] [--topic …] [--file a.png]');
+    if (text.length > MAX_TEXT) die(`${MAX_TEXT} karakteri geçtin (${text.length}). Metni dosya olarak gönder: hub say ${project} "<kısa özet>" --file <yol>\n     message is ${text.length} characters; the limit is ${MAX_TEXT}. Send the text as a file: hub say ${project} "<short summary>" --file <path>`);
+    const files = [];
+    for (const path of (opt.file || '').split(',').map(x => x.trim()).filter(Boolean)) {
+      let res;
+      try {
+        res = await fetch(`${BASE}/api/files?as=${encodeURIComponent(as)}&name=${encodeURIComponent(basename(path))}`, {
+          method: 'POST', headers: { 'X-Hub-Token': token, 'Content-Type': 'application/octet-stream' }, body: readFileSync(path),
+          signal: AbortSignal.timeout(30000),
+        });
+      } catch (e) { die(`upload failed: ${path} (${e.message})`); }
+      const f = await res.json();
+      if (!res.ok) die(`${path}: ${f.error}`);
+      files.push(f.id);
+    }
+    const m = await api('/api/messages', { project, author: as, kind, to, topic, text, tool, files, reply_to: opt.reply ? Number(opt.reply) : null });
+    console.log(line(m));
+    break;
+  }
+  case 'retract': {
+    needAs();
+    const id = Number(rest[0]);
+    if (!Number.isSafeInteger(id) || id < 1) die('usage: hub retract <messageId>');
+    console.log(line(await api('/api/messages/retract', { id, as })));
+    break;
+  }
+  case 'read': {
+    const n = Number(opt.n || 30);
+    const [project] = rest;
+    if (!project) die('usage: hub read <project> [-n 30]');
+    const q = new URLSearchParams({ project, limit: String(n) });
+    if (as) q.set('as', as);
+    for (const m of await api('/api/messages?' + q)) console.log(line(m));
+    break;
+  }
+  case 'unread': {
+    needAs();
+    mkdirSync(DATA, { recursive: true });
+    let since = 0;
+    try { since = JSON.parse(readFileSync(statePath(), 'utf8')).since || 0; } catch {}
+    const rows = await api(`/api/inbox?as=${encodeURIComponent(as)}&since=${since}&limit=200`);
+    for (const m of rows) console.log(line(m));
+    if (!rows.length) console.log('(no new messages for ' + as + ')');
+    else writeFileSync(statePath(), JSON.stringify({ since: rows.at(-1).id }));
+    break;
+  }
+  case 'usage': {
+    // hub usage                                  → everyone's limits
+    // hub usage --raw '<get_usage JSON as-is>'   → post MY limits (Claude Code desktop). Codex is automatic.
+    const raw = opt.raw;
+    if (raw) {
+      needAs();
+      let parsed;
+      try { parsed = JSON.parse(raw); } catch { die('--raw must be the JSON returned by get_usage'); }
+      await api('/api/usage', { agent: as, raw: parsed });
+    }
+    for (const u of await api('/api/usage')) {
+      const w = u.windows.map(x => `${x.label} %${x.percent_used}${x.resets_at ? ' (sıfırlanma ' + new Date(x.resets_at).toLocaleString('sv-SE').slice(5, 16) + ')' : ''}`).join(' · ');
+      console.log(`${u.agent}${u.plan ? ' [' + u.plan + ']' : ''}: ${w || '-'}  — ${u.source || '?'} ${new Date(u.updated_at).toLocaleString('sv-SE').slice(5, 16)}`);
+    }
+    break;
+  }
+  case 'get': {
+    const [id, dir = join(DATA, 'downloads')] = rest;
+    if (!/^[a-f0-9]{24}$/.test(id || '')) die('usage: hub get <fileId> [dir]');
+    const res = await fetch(`${BASE}/files/${id}`, { headers: { 'X-Hub-Token': token }, signal: AbortSignal.timeout(30000) }).catch(e => die(why(e, '/files', 30000)));
+    if (!res.ok) die(`HTTP ${res.status}`);
+    const name = decodeURIComponent((/filename\*=UTF-8''([^;]+)/.exec(res.headers.get('content-disposition') || '') || [])[1] || id).replace(/[\\/]/g, '_');
+    mkdirSync(dir, { recursive: true });
+    const out = join(dir, `${id.slice(0, 6)}-${name}`);
+    writeFileSync(out, Buffer.from(await res.arrayBuffer()));
+    console.log(out);
+    break;
+  }
+  case 'avatar': {
+    needAs();
+    const [v] = rest;
+    if (!v) die('usage: hub avatar <emoji | path/to/image.png>');
+    let avatar = v;
+    if (/\.(png|jpe?g|gif|webp)$/i.test(v)) {
+      const res = await fetch(`${BASE}/api/files?as=${encodeURIComponent(as)}&name=${encodeURIComponent(basename(v))}`, {
+        method: 'POST', headers: { 'X-Hub-Token': token, 'Content-Type': 'application/octet-stream' }, body: readFileSync(v), signal: AbortSignal.timeout(30000),
+      }).catch(e => die(e.message));
+      const f = await res.json();
+      if (!res.ok) die(f.error);
+      avatar = f.id;
+    }
+    const a = await api('/api/agents/profile', { name: as, avatar });
+    console.log(`${a.name}: ${a.avatar}`);
+    break;
+  }
+  case 'coordinator': {
+    const [name] = rest;
+    if (!name) die('usage: hub coordinator <agent name>');
+    const a = await api('/api/agents/profile', { name, role: 'coordinator' });
+    console.log(`⭐ coordinator: ${a.name}`);
+    break;
+  }
+  case 'retire': {
+    needAs();
+    const [name] = rest;
+    if (!name) die('usage: hub retire <agent name>');
+    const a = await api('/api/agents/retire', { as, name, retired: 1 });
+    console.log(`retired: ${a.name}`);
+    break;
+  }
+  case 'unretire': {
+    needAs();
+    const [name] = rest;
+    if (!name) die('usage: hub unretire <agent name>');
+    const a = await api('/api/agents/retire', { as, name, retired: 0 });
+    console.log(`unretired: ${a.name}`);
+    break;
+  }
+  case 'rules': {
+    const sub = rest[0];
+    if (sub === 'add') {
+      needAs();
+      const text = rest.slice(1).join(' ').trim();
+      const category = flag('category') || opt.topic || opt.note || 'Nasıl çalışırız';
+      const project = flag('project') || null;
+      if (!text) die('usage: hub rules add "<kural metni>" [--category <kategori>] [--project <proje>]');
+      const r = await api('/api/rules', { as, text, category, project });
+      const pInfo = r.project ? ` [proje: ${r.project}]` : '';
+      console.log(`kural eklendi: #${r.id} [${r.category}]${pInfo} ${r.text}`);
+    } else if (sub === 'delete') {
+      needAs();
+      const id = Number(rest[1]);
+      if (!id) die('usage: hub rules delete <id>');
+      await api('/api/rules', { as, id }, 'DELETE');
+      console.log(`kural silindi: #${id}`);
+    } else {
+      const proj = (rest[0] && rest[0] !== 'all') ? rest[0] : (flag('project') || null);
+      const list = await api('/api/rules' + (proj ? `?project=${encodeURIComponent(proj)}` : ''));
+      if (!list.length) { console.log('Henüz tanımlanmış bir kural yok.'); break; }
+      console.log('📋 Agent Hub Çalışma Kuralları:' + (proj ? ` (${proj})` : ''));
+      let currentCat = '';
+      for (const r of list) {
+        if (r.category !== currentCat) {
+          currentCat = r.category;
+          console.log(`\n## ${currentCat}`);
+        }
+        const pLabel = r.project ? ` [${r.project}]` : '';
+        console.log(`${r.sort_order}. ${r.text}${pLabel}  (ekleyen: ${r.created_by})`);
+      }
+    }
+    break;
+  }
+  case 'config': {
+    const sub = rest[0];
+    if (sub === 'set') {
+      needAs();
+      const payload = { as };
+      if (opt.port) {
+        const p = Number(opt.port);
+        if (isNaN(p) || p < 1024 || p > 65535) die('port must be an integer between 1024 and 65535');
+        payload.port = p;
+      }
+      if (opt.lan !== null && opt.lan !== undefined) {
+        payload.lan = opt.lan === 'true' || opt.lan === 'on' || opt.lan === '1';
+      }
+      if (opt.operator) {
+        payload.operator = String(opt.operator).trim();
+      }
+      if (payload.port === undefined && payload.lan === undefined && payload.operator === undefined) {
+        die('usage: hub config set [--port <port>] [--lan <true|false>] [--operator <name>]');
+      }
+      const res = await api('/api/config', payload);
+      console.log(`✓ Yapılandırma güncellendi: port=${res.config.port}, lan=${res.config.lan ? 'açık' : 'kapalı'}, operator=${res.config.operator || 'Operator'}`);
+      if (res.restartRequired) {
+        console.log(`ℹ️ Yeni ayarların geçerli olması için servisi yeniden başlatın:\n   ${res.command}`);
+      }
+    } else {
+      const cfg = await api('/api/config');
+      console.log(`Agent Hub Yapılandırması:`);
+      console.log(`- Operatör: ${cfg.operator || 'Operator'} (kayıtlı: ${cfg.configuredOperator || 'Operator'})`);
+      console.log(`- Çalışan Port: ${cfg.port} (kayıtlı: ${cfg.configuredPort})`);
+      console.log(`- LAN Modu: ${cfg.lan ? 'Açık' : 'Kapalı'} (kayıtlı: ${cfg.configuredLan ? 'açık' : 'kapalı'})`);
+      console.log(`- Dinlenen Host: ${cfg.listenHost}`);
+      console.log(`- Veri Dizini: ${cfg.dataDir}`);
+      if (cfg.localIps && cfg.localIps.length) {
+        console.log(`- Yerel Ağ (LAN) Adresleri:`);
+        for (const ip of cfg.localIps) {
+          console.log(`    http://${ip}:${cfg.port}`);
+        }
+      }
+    }
+    break;
+  }
+  case 'schedule': {
+    const s = (await api('/api/config')).agentSchedule;
+    const lang = opt.lang || process.env.HUB_LANG || 'en';
+    if (!Object.hasOwn(SCHEDULE_I18N, lang)) die('unsupported language; use --lang en|tr|ja|ar|zh');
+    const result = scheduleText(s, lang);
+    if (result.error) die(result.error);
+    for (const line of result.lines) console.log(line);
+    break;
+  }
+  case 'projects':
+    for (const p of await api('/api/projects')) console.log(`${p.slug}\t${p.count} messages`);
+    break;
+  case 'who': {
+    const q = opt.all ? '?all=1' : '';
+    for (const a of await api('/api/agents' + q)) console.log(`${a.role === 'coordinator' ? '⭐ ' : ''}${a.name}${a.retired ? ' [retired]' : ''}\t${a.color}\t${a.tool || ''}\t${a.avatar || ''}\tlast seen ${a.last_seen || '-'}`);
+    break;
+  }
+  case 'import': {
+    const [project, file] = rest;
+    if (!project || !file) die('usage: hub import <project> <LOG.md>');
+    let ok = 0;
+    for (const raw of readFileSync(file, 'utf8').split('\n')) {
+      const m = parseLogLine(raw);
+      if (!m) continue;
+      const res = await fetch(BASE + '/api/messages', {
+        method: 'POST', headers: { 'X-Hub-Token': token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project, ...m, source: 'log' }),
+      });
+      if (res.ok) ok++; else console.error(`skipped: ${raw.slice(0, 80)} (${(await res.json()).error})`);
+    }
+    console.log(`imported ${ok} lines into ${project}`);
+    break;
+  }
+  case 'log': {
+    // Bridge for scripts/coord.sh: hub log <project> "<Agent> · <TYPE> · <package> · <details>"
+    const [project, ...words] = rest;
+    const m = parseLogLine(words.join(' '));
+    if (!project || !m) die('usage: hub log <project> "<Agent> · <TYPE> · <package> · <details>"');
+    console.log(line(await api('/api/messages', { project, ...m, tool, source: 'log' })));
+    break;
+  }
+  default:
+    console.log(readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(1, 14).map(l => l.replace(/^\/\/ ?/, '')).join('\n'));
+}

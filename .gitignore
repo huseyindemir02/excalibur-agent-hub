@@ -1,0 +1,9 @@
+node_modules/
+*.log
+
+# The chat database and anything else the running hub writes. The real data
+# lives in ~/.agent-hub; these are stray copies a wrong working directory can
+# create, and they must never reach a public repository.
+*.db
+*.sqlite3
+*.sqlite
