@@ -552,6 +552,80 @@ test('Headless Chrome DOM, CSS & Network Regressions', async (t) => {
       assert.ok(translated.modalOverflow <= 2, `${lang}: settings must not overflow horizontally on mobile`);
     }
 
+    // Theme actions must survive language changes and keep toolbar geometry stable.
+    for (const width of [1500, 1150, 375, 320]) {
+      await send('Emulation.setDeviceMetricsOverride', { width, height: 900, deviceScaleFactor: 1, mobile: width < 600 });
+      for (const lang of ['en', 'tr', 'ja', 'ar', 'zh']) {
+        const themeMetrics = await evaluate(`
+          (async () => {
+            const tick = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+            const btn = document.getElementById('toggleTheme');
+            const select = document.getElementById('langSelect');
+            if (document.body.classList.contains('theme-matrix')) btn.click();
+            select.value = ${JSON.stringify(lang)};
+            select.dispatchEvent(new Event('change'));
+            document.querySelector('.app').classList.remove('left-open', 'right-open');
+            if (innerWidth < 600 && !document.querySelector('.app').classList.contains('mobile-menu-open')) {
+              document.getElementById('mobileMoreBtn').click();
+            }
+            const snapshot = () => ({
+              matrix: document.body.classList.contains('theme-matrix'),
+              text: btn.textContent, title: btn.title,
+              overflow: document.documentElement.scrollWidth > innerWidth,
+              controls: [...document.querySelectorAll('#panelToggles > *')].filter(el => el.getBoundingClientRect().width > 0).map(el => {
+                const r = el.getBoundingClientRect();
+                return { id: el.id, x: r.x, y: r.y, width: r.width, height: r.height };
+              })
+            });
+            await tick();
+            const modern = snapshot();
+            btn.click();
+            // Changing language while Matrix is active used to overwrite Modern with Matrix.
+            select.value = ${JSON.stringify(lang === 'en' ? 'tr' : 'en')};
+            select.dispatchEvent(new Event('change'));
+            select.value = ${JSON.stringify(lang)};
+            select.dispatchEvent(new Event('change'));
+            if (innerWidth < 600) document.getElementById('mobileMoreBtn').click();
+            await tick();
+            const matrix = snapshot();
+            btn.click();
+            await tick();
+            return { modern, matrix, returned: snapshot() };
+          })()
+        `);
+        const label = width + 'px / ' + lang;
+        assert.equal(themeMetrics.modern.text, '🕶️ Matrix', label);
+        assert.equal(themeMetrics.matrix.text, '💻 Modern', label);
+        assert.equal(themeMetrics.matrix.title, themeMetrics.matrix.text, label);
+        assert.equal(themeMetrics.matrix.matrix, true, label);
+        assert.equal(themeMetrics.returned.matrix, false, label);
+        assert.equal(themeMetrics.returned.text, '🕶️ Matrix', label);
+        assert.equal(themeMetrics.matrix.overflow, false, label);
+        assert.ok(themeMetrics.matrix.controls.some(c => c.id === 'toggleTheme'), label + ' theme control visible');
+        for (let j = 0; j < themeMetrics.modern.controls.length; j++) {
+          const before = themeMetrics.modern.controls[j], after = themeMetrics.matrix.controls[j];
+          assert.equal(after.id, before.id, label);
+          for (const dimension of ['x', 'y', 'width', 'height']) {
+            assert.ok(Math.abs(after[dimension] - before[dimension]) <= 1, label + ' ' + before.id + ' ' + dimension + ': ' + before[dimension] + ' → ' + after[dimension]);
+          }
+        }
+      }
+    }
+
+    // A persisted Matrix preference must still offer the Modern action after reload.
+    await evaluate(`document.getElementById('toggleTheme').click()`);
+    await send('Page.reload');
+    let restoredTheme;
+    for (let i = 0; i < 50; i++) {
+      await new Promise(r => setTimeout(r, 100));
+      restoredTheme = await evaluate(`(() => {
+        const btn = document.getElementById('toggleTheme');
+        return btn && document.readyState === 'complete' ? { matrix: document.body.classList.contains('theme-matrix'), text: btn.textContent, title: btn.title } : null;
+      })()`);
+      if (restoredTheme?.text === '💻 Modern') break;
+    }
+    assert.deepEqual(restoredTheme, { matrix: true, text: '💻 Modern', title: '💻 Modern' });
+
     ws.close();
   } finally {
     chrome.kill('SIGKILL');

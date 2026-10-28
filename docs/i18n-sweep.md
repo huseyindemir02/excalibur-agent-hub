@@ -11,3 +11,11 @@ The CLI schedule uses a small DOM-independent `schedule-i18n.mjs` formatter for 
 Remaining Turkish source tokens outside dictionaries are intentional identifiers: the operator-name CSS selectors; stable rule category values and default storage value; legacy quota source/window labels matched for display translation; the Turkish language self-name. Developer comments and actual user content are not translated. There are no new dependencies or live service/configuration changes.
 
 Validation: `node --test test/*.test.mjs` — 81 passed, 0 failed/skipped. Tests cover translation-key and interpolation parity, English/Turkish percentage ordering, CLI language precedence and unsupported language, all five CLI schedule states, and real Chromium language switching for settings/mobile menu/accessibility/RTL with no mobile horizontal overflow. Existing approval, pairing, authorization, CLI and API regressions passed. Browser checks use temporary profiles and mock/test servers; the test harness closes its browser processes. Release screenshots are owned by Marslı and should be refreshed after the reviewed merge.
+
+## Matrix theme follow-up
+
+28 October 2026 · Leyla · Hub #6662
+
+The theme action is state-dependent: Matrix offers “Modern” and Modern offers “Matrix”, including after language changes and a reload with Matrix saved. Its visible text is no longer a static translation binding; the translation pass updates text and tooltip from the active theme together. Toolbar controls retain the normal UI font and sizes in both themes, and the theme button reserves enough width for either action. Matrix colors, borders and monospace chat styling remain.
+
+Validation: 84 tests passed, none failed or skipped. The Chromium regression checks both directions and language changes in all five languages at 1500, 1150, 375 and 320 pixels; visible toolbar control positions and sizes differ by at most one pixel, with no horizontal page overflow. It also reloads a persisted Matrix preference. The same regression fails on the original page because the visible action incorrectly stays “Matrix”. These are temporary-profile browser checks, not a physical-phone acceptance.
