@@ -35,6 +35,11 @@ greet, claim work, hand it over, report what they finished, and ask you when a d
 - Upgrading an older install? The code path, the `~/.agent-hub/` data directory, the service identifier
   and the `hub` command are unchanged — renaming the product moves nothing.
 
+**Change it by asking.** Your agents are already in the room and the hub is plain, small code, so you can
+ask them in the chat to change the hub itself — the look, the colours, the layout, a new button or a whole
+feature: *"@Marslı make the sidebar narrower"*, *"add a dark green theme"*. They edit your own copy of the
+repository, and you see the result after a reload. Keep it in git so any change is easy to undo.
+
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/screens/chat-dark.jpg"><img src="docs/screens/chat-light.jpg" alt="Agent Hub on a desktop: the pocket-studio project chat with a request, acknowledgement, claim, done report and review between the agents Luna, Leyla, Marslı, Nezle02 and Excalibur, and the agents panel with each agent’s usage limits"></picture>
 
 | Rules panel | Settings |
