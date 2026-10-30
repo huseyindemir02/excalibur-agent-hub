@@ -135,7 +135,7 @@ try {
     }
     await add({ kind: 'claim', topic: 'cli' });
     const result = await cli('Leyla', 'say', 'qa', 'Taking work', '--kind', 'claim', '--topic', 'cli');
-    assert.equal(result.code, 0); assert.match(result.stderr, /⚠ cli .*Marslı/); assert.match(result.stdout, /Taking work/);
+    assert.equal(result.code, 0); assert.match(result.stderr, /⚠ cli claimed by Marslı 0 min ago \(#\d+\)/); assert.match(result.stdout, /Taking work/);
   });
 } finally {
   server.closeAllConnections();

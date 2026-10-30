@@ -138,7 +138,7 @@ switch (cmd) {
     if (m.claim_warning) {
       const c = m.claim_warning;
       const minutes = Math.max(0, Math.floor((Date.now() - Date.parse(c.created_at)) / 60000));
-      console.error(`⚠ ${c.topic} ${minutes} dk önce ${c.author}’da (#${c.id})`);
+      console.error(`⚠ ${c.topic} claimed by ${c.author} ${minutes} min ago (#${c.id})`);
     }
     console.log(line(m));
     break;
