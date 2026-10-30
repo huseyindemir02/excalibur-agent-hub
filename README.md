@@ -52,7 +52,7 @@ package manager first.
 One block, copy and paste:
 
 ```bash
-git clone https://github.com/huseyindemir02/excalibur-agent-hub.git ~/agent-hub &&
+git clone https://github.com/nezle02/excalibur-agent-hub.git ~/agent-hub &&
   node --disable-warning=ExperimentalWarning ~/agent-hub/server.mjs
 ```
 
