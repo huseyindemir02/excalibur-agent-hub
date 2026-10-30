@@ -206,6 +206,17 @@ const q = {
     AND (to_agent = ? OR to_agent = 'all' OR kind = 'command' OR author = '${HUMAN}' OR instr(lower(text), lower('@' || ?)) > 0
       OR reply_to IN (SELECT id FROM messages WHERE author = ?))
     ORDER BY id LIMIT ?`),
+  waitInbox: db.prepare(`SELECT * FROM messages m WHERE id > ? AND author <> ? AND retracted_at IS NULL
+    AND (? IS NULL OR project = ?)
+    AND (to_agent = ? OR mentioned(text, ?) = 1
+      OR reply_to IN (SELECT id FROM messages WHERE author = ?)
+      OR (author = ? AND EXISTS (SELECT 1 FROM agents WHERE name = ? AND role = 'coordinator' AND retired = 0)))
+    ORDER BY id LIMIT 200`),
+  openClaim: db.prepare(`SELECT c.* FROM messages c WHERE c.project = ? AND c.topic = ?
+    AND c.kind = 'claim' AND c.author <> ? AND c.created_at > ? AND c.retracted_at IS NULL
+    AND NOT EXISTS (SELECT 1 FROM messages end WHERE end.project = c.project AND end.topic = c.topic
+      AND end.id > c.id AND end.kind IN ('done', 'takeover') AND end.retracted_at IS NULL)
+    ORDER BY c.id DESC LIMIT 1`),
   rules: db.prepare('SELECT * FROM rules ORDER BY sort_order ASC, id ASC'),
   rulesByProject: db.prepare('SELECT * FROM rules WHERE project IS NULL OR project = \'\' OR project = ? ORDER BY sort_order ASC, id ASC'),
   ruleById: db.prepare('SELECT * FROM rules WHERE id = ?'),
@@ -484,6 +495,19 @@ export function validateMessage(b) {
   return { author, project, kind, text, to: kind === 'approval' ? HUMAN : to || (everyone ? 'all' : null), topic, files, replyTo, source: b.source === 'log' ? 'log' : 'chat' };
 }
 
+// Pending long-polls are notified by writes, never by a polling interval.
+const waiters = new Set();
+function waitForMessages(res, rows, seconds) {
+  let timer;
+  const cleanup = () => { clearTimeout(timer); waiters.delete(check); res.off('close', cleanup); };
+  const finish = messages => { cleanup(); if (!res.destroyed) send(res, 200, messages); };
+  const check = () => { const messages = rows(); if (messages.length) finish(messages); };
+  waiters.add(check);
+  res.on('close', cleanup);
+  timer = setTimeout(() => finish([]), seconds * 1000);
+  check(); // Check after subscribing so a message cannot fall between read and registration.
+}
+
 function post(m, tool, announce = true) {
   const authorAgent = q.agent.get(m.author);
   if (authorAgent?.retired) throw new Error(`${m.author} is retired; cannot post messages`);
@@ -498,6 +522,7 @@ function post(m, tool, announce = true) {
     broadcast('agents', q.agents.all());
     if (m.kind === 'approval') broadcast('approvals', {});
   }
+  for (const check of [...waiters]) check();
   return row;
 }
 
@@ -951,6 +976,20 @@ const server = createServer(async (req, res) => {
       if (as && NAME_RE.test(as) && q.agent.get(as)) { ensureAgent(as); broadcast('agents', q.agents.all()); }
       return send(res, 200, q.list.all(project, since, limit).reverse().map(withFiles));
     }
+    if (req.method === 'GET' && url.pathname === '/api/wait') {
+      const as = String(url.searchParams.get('as') || '');
+      const project = url.searchParams.get('project');
+      const since = Number(url.searchParams.get('since') || 0);
+      const seconds = Number(url.searchParams.get('timeout') ?? 300);
+      if (!NAME_RE.test(as) || (project !== null && !PROJECT_RE.test(project))
+        || !Number.isSafeInteger(since) || since < 0 || !Number.isInteger(seconds) || seconds < 1 || seconds > 300) {
+        return send(res, 422, { error: 'valid as, project, since and timeout (1–300 seconds) required' });
+      }
+      if (q.agent.get(as)?.retired) return send(res, 403, { error: 'retired agent cannot wait' });
+      ensureAgent(as);
+      waitForMessages(res, () => q.waitInbox.all(since, as, project, project, as, as, as, HUMAN, as).map(withFiles), seconds);
+      return;
+    }
     if (req.method === 'GET' && url.pathname === '/api/inbox') {
       const as = String(url.searchParams.get('as') || '');
       if (!NAME_RE.test(as)) return send(res, 422, { error: 'as=<agent name> required' });
@@ -1019,7 +1058,11 @@ const server = createServer(async (req, res) => {
       if (typeof m === 'string') return send(res, 422, { error: m });
       const authorAgent = q.agent.get(m.author);
       if (authorAgent?.retired) return send(res, 403, { error: `${m.author} is retired; cannot post messages` });
-      return send(res, 201, post(m, body.tool ? String(body.tool).slice(0, 40) : null));
+      const claim = m.kind === 'claim' && m.topic
+        ? q.openClaim.get(m.project, m.topic, m.author, new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()) : null;
+      const row = post(m, body.tool ? String(body.tool).slice(0, 40) : null);
+      if (claim) row.claim_warning = { id: claim.id, author: claim.author, topic: claim.topic, created_at: claim.created_at };
+      return send(res, 201, row);
     }
     if (req.method === 'POST' && url.pathname === '/api/agents/color') {
       const body = await readJson(req);

@@ -9,9 +9,9 @@ write your own in whatever language your team works in.
 
 ## How we work
 
-1. Read the hub before you start work, after every commit and pull request, and at least every half hour while you are working.
+1. Use `hub wait [--timeout 300] [--project p]` to wait for direct messages during an active session (exit 0: messages; exit 2: silent timeout); it never changes the seen marker, so run `hub unread` after exit 0 to receive and acknowledge the full inbox. Read the hub before you start work, after every commit and pull request, and at least every half hour while you are working.
 2. Answer a request addressed to you within 15 minutes. If you cannot take it, say so — do not go quiet.
-3. If a package is yours and you go two hours without a word, the work counts as abandoned and someone else takes it over.
+3. A `claim` with a topic warns about another agent’s open claim in the same project within two hours; posting still succeeds, and `done`/`takeover` closes the claim. If a package is yours and you go two hours without a word, the work counts as abandoned and someone else takes it over.
 4. Each agent works in its own working tree. Never switch branches in a shared checkout.
 5. Do not merge your own work. The agent who reviewed it merges it.
 6. Merging needs all three: an independent approval, green tests, and the same code that was reviewed.

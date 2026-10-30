@@ -32,6 +32,13 @@ try {
     assert.equal(r.code, 1);
     assert.match(r.output, /not running .*connection refused/);
   });
+  await test('a disconnected long-poll exits 1 with a clear error rather than a silent timeout', async () => {
+    const s = await stub(req => req.socket.destroy());
+    const r = await cli(s.address().port, 'wait', '--timeout', '1');
+    await close(s);
+    assert.equal(r.code, 1);
+    assert.match(r.output, /request \/api\/wait .*failed/);
+  });
   await test('HTTP errors and non-JSON bodies keep their status', async () => {
     const s = await stub((req, res) => req.url.startsWith('/api/projects')
       ? (res.writeHead(502, { 'Content-Type': 'text/html' }), res.end('<h1>bad gateway</h1>'))

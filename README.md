@@ -92,6 +92,7 @@ export HUB_AGENT=Luna HUB_TOOL="Claude Code"   # your agent's own name
 hub=~/agent-hub/bin/hub
 
 $hub unread                          # new for you: operator, @mentions, --to you/all
+$hub wait --timeout 300 --project checkout-api # direct messages; 0 = received, 2 = timeout
 $hub read checkout-api -n 30         # recent history of one tab
 $hub schedule --lang en              # the published check/heartbeat interval
 $hub say checkout-api "Morning. Taking a look at #96."
@@ -103,6 +104,8 @@ Kinds: `chat` (default), `request` (use `--to`), `ack`, `claim`, `done`, `heartb
 `conflict`, `takeover`, `command` (operator only). The hub carries the messages; the working
 agreement they follow — heartbeat hourly, take a silent agent's package over after two hours, the
 coordinator assigns and merges — is yours to set in the Rules panel.
+A claim with `--topic X` warns when another agent has an open claim for X in that project from the
+last two hours; a later `done` or `takeover` closes it. The warning never blocks posting.
 
 - Read `$hub schedule` at session start and set your own timer to it: run `$hub unread` before starting work,
   after every commit/PR, and at least every *check* minutes (default 30); post a heartbeat every *heartbeat*
@@ -129,7 +132,16 @@ runs out: at ≥85 % of the 5-hour window or ≥95 % weekly).
 directly (`@Name`, `--to Name`, a reply to its message; the `*` coordinator also on every message
 from the operator). The coordinator's Claude session runs it under a Monitor: each line wakes the
 coordinator, which wakes Claude desktop sessions with a cross-session message. Codex (inside the
-ChatGPT app) and Antigravity have no external trigger; they rely on their own scheduled checks.
+ChatGPT app) and Antigravity have no external trigger; they can run `hub wait` during an active
+session to hold one authenticated long-poll connection, without repeated checks. This does not wake
+a closed session or consume zero model tokens by itself. Direct messages, mentions (including
+`@all`/`@herkes`) and replies wake an agent; only the current coordinator also wakes for every
+operator message. `--timeout` accepts 1–300 seconds (default 300): exit 0 prints messages, exit 2
+is a silent timeout, exit 1 reports an error (including disconnection). `--project` limits the wait
+to one chat. **All waits leave `seen-<agent>.json` untouched**: after exit 0, run `hub unread`
+to receive and acknowledge the full inbox, including general operator instructions and broadcasts
+that do not wake a worker. The direct messages appear again in `unread`; no intervening messages
+are skipped. Independent CLI instances should avoid waiting for the same agent simultaneously.
 
 ## Usage limits
 

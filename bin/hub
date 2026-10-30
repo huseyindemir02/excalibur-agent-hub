@@ -4,6 +4,7 @@
 //   hub retract <messageId>            retract your own chat message (log records are protected)
 //   hub get <fileId> [dir]              download an attachment (default ~/.agent-hub/downloads) — e.g. to look at a screenshot
 //   hub read <project> [-n 30]          last messages of a project tab
+//   hub wait [--timeout 300] [--project p]   wait for a direct message (exit 0), timeout silently (exit 2)
 //   hub unread                          everything new for me (all projects): operator, @mentions, --to me/all
 //   hub avatar <emoji | image.png>     your profile picture   ·   hub coordinator <name>   move the ⭐ (handoff)
 //   hub retire <name> | hub unretire <name>   retire/unretire an agent (operator or coordinator only)
@@ -57,17 +58,17 @@ function why(e, path, ms = TIMEOUT_MS) {
   return `request ${path} to ${BASE} failed: ${[code, e?.cause?.message || e?.message].filter(Boolean).join(' ')}`;
 }
 
-async function api(path, body, method = null) {
+async function api(path, body, method = null, timeout = TIMEOUT_MS) {
   let res, raw;
   try {
     res = await fetch(BASE + path, {
       method: method || (body ? 'POST' : 'GET'),
       headers: { 'X-Hub-Token': token, 'Content-Type': 'application/json' },
       body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeout),
     });
     raw = await res.text();
-  } catch (e) { die(why(e, path.split('?')[0])); }
+  } catch (e) { die(why(e, path.split('?')[0], timeout)); }
   let json;
   try { json = JSON.parse(raw); } catch { die(`HTTP ${res.status} from ${path.split('?')[0]}: response is not JSON`); }
   if (!res.ok) die(`HTTP ${res.status}: ${json.error || 'request failed'}`);
@@ -134,6 +135,11 @@ switch (cmd) {
       files.push(f.id);
     }
     const m = await api('/api/messages', { project, author: as, kind, to, topic, text, tool, files, reply_to: opt.reply ? Number(opt.reply) : null });
+    if (m.claim_warning) {
+      const c = m.claim_warning;
+      const minutes = Math.max(0, Math.floor((Date.now() - Date.parse(c.created_at)) / 60000));
+      console.error(`⚠ ${c.topic} ${minutes} dk önce ${c.author}’da (#${c.id})`);
+    }
     console.log(line(m));
     break;
   }
@@ -153,15 +159,32 @@ switch (cmd) {
     for (const m of await api('/api/messages?' + q)) console.log(line(m));
     break;
   }
+  case 'wait':
   case 'unread': {
     needAs();
+    const waiting = cmd === 'wait';
+    const seconds = Number(flag('timeout') ?? 300);
+    const project = flag('project');
+    if (waiting && (!Number.isInteger(seconds) || seconds < 1 || seconds > 300)) die('--timeout must be 1–300 whole seconds');
+    if (waiting && project !== null && !/^[a-z0-9][a-z0-9-]{0,39}$/.test(project)) die('invalid --project');
     mkdirSync(DATA, { recursive: true });
     let since = 0;
     try { since = JSON.parse(readFileSync(statePath(), 'utf8')).since || 0; } catch {}
-    const rows = await api(`/api/inbox?as=${encodeURIComponent(as)}&since=${since}&limit=200`);
+    const query = new URLSearchParams({ as, since: String(since), limit: '200' });
+    if (waiting) {
+      query.set('timeout', String(seconds));
+      if (project) query.set('project', project);
+    }
+    const rows = await api((waiting ? '/api/wait?' : '/api/inbox?') + query, null, null, waiting ? seconds * 1000 + TIMEOUT_MS : TIMEOUT_MS);
     for (const m of rows) console.log(line(m));
-    if (!rows.length) console.log('(no new messages for ' + as + ')');
-    else writeFileSync(statePath(), JSON.stringify({ since: rows.at(-1).id }));
+    if (waiting && !rows.length) process.exitCode = 2;
+    else if (!waiting && !rows.length) console.log('(no new messages for ' + as + ')');
+    // Wait only signals attention; unread acknowledges the full inbox, including operator instructions.
+    if (rows.length && !waiting) {
+      let latest = 0;
+      try { latest = JSON.parse(readFileSync(statePath(), 'utf8')).since || 0; } catch {}
+      writeFileSync(statePath(), JSON.stringify({ since: Math.max(latest, rows.at(-1).id) }));
+    }
     break;
   }
   case 'usage': {
